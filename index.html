@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#101827">
-<title>G1 Text Sender</title>
+<title>G1 Text Sender v2</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1220;--panel:#121c2c;--border:#2b3a50;--text:#eef4ff;--muted:#a8b7cc;--accent:#6ee7c2;--warn:#ffd27d;--bad:#ff9a9a}
 *{box-sizing:border-box}body{margin:0;background:linear-gradient(160deg,#101827,#090f1b 65%);color:var(--text);font:16px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;min-height:100vh}
@@ -15,7 +15,7 @@ main{max-width:680px;margin:0 auto;padding:22px 16px 40px}.eyebrow{font-size:.78
 <main>
   <div class="eyebrow">Unofficial · Phone Bluetooth</div>
   <h1>G1 Text Sender</h1>
-  <p class="intro">Type text on your Android phone and send it directly to your Even Realities G1 glasses. Your computer is only needed to upload this page to a secure website—not for Bluetooth.</p>
+  <p class="intro">Type text on your Android phone and send it directly to both Even Realities G1 lenses. Bluetooth runs on your phone; no PC Bluetooth or Python runtime is needed.</p>
 
   <section class="panel">
     <h2>1. Connect the glasses</h2>
@@ -45,7 +45,7 @@ main{max-width:680px;margin:0 auto;padding:22px 16px 40px}.eyebrow{font-size:.78
       <button id="send" disabled>Send to glasses</button>
       <button id="clear" class="secondary">Clear text</button>
     </div>
-    <p class="tiny">Long text is split into pages and sent sequentially. Send works with either lens connected; connect both to mirror text to both sides.</p>
+    <p class="tiny">Connect both lenses before sending. Text-only mode is used (not Even AI/recording mode); long text is split into pages.</p>
   </section>
 
   <section class="panel">
@@ -74,7 +74,7 @@ main{max-width:680px;margin:0 auto;padding:22px 16px 40px}.eyebrow{font-size:.78
     const el = $(side + 'Status'); el.textContent = text; el.classList.toggle('ok', ok);
     $(side + 'Connect').style.display = sides[side].device ? 'none' : 'block';
     $(side + 'Disconnect').style.display = sides[side].device ? 'block' : 'none';
-    $('send').disabled = !Object.values(sides).some(s => s.tx && s.server && s.server.connected);
+    $('send').disabled = !['left','right'].every(side => sides[side].tx && sides[side].server && sides[side].server.connected);
   }
   function updateCount(){ $('count').textContent = `${$('message').value.length} characters`; }
   $('message').addEventListener('input', updateCount); updateCount();
@@ -87,10 +87,16 @@ main{max-width:680px;margin:0 auto;padding:22px 16px 40px}.eyebrow{font-size:.78
     else await s.tx.writeValue(payload);
   }
   async function sendPacket(side, text, pageNo, pageMax, screenStatus) {
+    const s = sides[side];
     const body = enc.encode(text);
     const packet = new Uint8Array(9 + body.length);
-    packet.set([0x4e, 0x00, 0x01, 0x00, screenStatus, 0x00, 0x00, pageNo & 255, pageMax & 255], 0);
+    const seq = s.seq & 0xff;
+    s.seq = (s.seq + 1) & 0xff;
+    // 0x4E text packet; screen status high nibble 0x70 = Text Only,
+    // low nibble 0x01 = start a new canvas, 0x00 = continue current canvas.
+    packet.set([0x4e, seq, 0x01, 0x00, screenStatus, 0x00, 0x00, pageNo & 255, pageMax & 255], 0);
     packet.set(body, 9);
+    log(`${side} → 4E text packet; status 0x${screenStatus.toString(16).padStart(2,'0')}; ${body.length} UTF-8 bytes.`);
     await writeRaw(side, packet);
   }
   function formatLines(text) {
@@ -119,17 +125,12 @@ main{max-width:680px;margin:0 auto;padding:22px 16px 40px}.eyebrow{font-size:.78
     if (!lines.length) throw new Error('Enter some text first');
     const pages = [];
     for (let i=0;i<lines.length;i+=5) pages.push(lines.slice(i,i+5));
-    // The repository's protocol marks new content with 0x31 and regular display with 0x30.
-    if (pages.length > 1) {
-      await sendPacket(side, lines[0], 1, pages.length, 0x31);
-      await new Promise(r => setTimeout(r, 100));
-    }
     for (let i=0;i<pages.length;i++) {
-      await sendPacket(side, paddedPage(pages[i]), i+1, pages.length, 0x30);
-      if (i < pages.length - 1) await new Promise(r => setTimeout(r, 2000));
+      // 0x71 = Text Only + Start New Canvas; 0x70 = Text Only + continue.
+      const status = i === 0 ? 0x71 : 0x70;
+      await sendPacket(side, paddedPage(pages[i]), i+1, pages.length, status);
+      if (i < pages.length - 1) await new Promise(r => setTimeout(r, 500));
     }
-    const last = paddedPage(pages[pages.length-1]);
-    await sendPacket(side, last, pages.length, pages.length, 0x40);
   }
   async function connectSide(side) {
     if (!('bluetooth' in navigator)) {
@@ -160,6 +161,13 @@ main{max-width:680px;margin:0 auto;padding:22px 16px 40px}.eyebrow{font-size:.78
       });
     } catch (e) { log(`${side} RX notifications unavailable (text sending can still be tried): ${e.message}`); }
     sides[side].device = device; sides[side].server = server; sides[side].tx = tx; sides[side].rx = rx;
+    // Match the Android G1 demo connection handshake before sending display commands.
+    try {
+      await writeRaw(side, new Uint8Array([0xF4, 0x01]));
+      log(`${side} lens initialization sent (F4 01).`);
+    } catch (e) {
+      log(`${side} lens initialization warning: ${e.message}`);
+    }
     device.addEventListener('gattserverdisconnected', () => {
       clearInterval(sides[side].heartbeat);
       sides[side] = {device:null,server:null,tx:null,rx:null,heartbeat:null,seq:1};
@@ -187,7 +195,7 @@ main{max-width:680px;margin:0 auto;padding:22px 16px 40px}.eyebrow{font-size:.78
     const text = $('message').value.trim();
     if (!text) { alert('Please type some text first.'); return; }
     const active = ['left','right'].filter(side => sides[side].tx && sides[side].server && sides[side].server.connected);
-    if (!active.length) { alert('Connect at least one lens first.'); return; }
+    if (active.length !== 2) { alert('Connect both the left and right G1 lenses before sending text.'); return; }
     $('send').disabled = true;
     try {
       for (const side of active) {
@@ -197,14 +205,14 @@ main{max-width:680px;margin:0 auto;padding:22px 16px 40px}.eyebrow{font-size:.78
       }
       log('Send sequence finished. Check the glasses for display.');
     } catch(e) { log(`Send failed: ${e.message}`); alert(`Send failed: ${e.message}`); }
-    finally { $('send').disabled = !Object.values(sides).some(s => s.tx && s.server && s.server.connected); }
+    finally { $('send').disabled = !['left','right'].every(side => sides[side].tx && sides[side].server && sides[side].server.connected); }
   });
   if (!window.isSecureContext) {
     $('notice').textContent = 'Not a secure context. Open this page using its HTTPS GitHub Pages address; ordinary http://LAN-IP pages cannot use Web Bluetooth.';
   } else if (!('bluetooth' in navigator)) {
     $('notice').textContent = 'This browser does not expose Web Bluetooth. Use current Chrome on Android; iOS Safari is not supported.';
   } else {
-    $('notice').textContent = 'Secure context detected. Use Chrome on Android and grant Bluetooth access when prompted.';
+    $('notice').textContent = 'Secure context detected. Connect both lenses. This version uses the protocol Text Only display mode.';
   }
 })();
 </script>
